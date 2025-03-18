@@ -1,0 +1,80 @@
+FROM ubuntu:22.04
+
+# Install dependencies
+RUN apt-get update && \
+    apt-get install -y \
+    curl \
+    wget \
+    gnupg2 \
+    apt-transport-https \
+    ca-certificates \
+    s3cmd \
+    cron \
+    supervisor \
+    python3 \
+    python3-pip \
+    jq \
+    tar \
+    gzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install ClickHouse client
+RUN apt-key adv --keyserver keyserver.ubuntu.com --recv E0C56BD4 && \
+    echo "deb https://packages.clickhouse.com/deb stable main" | tee /etc/apt/sources.list.d/clickhouse.list && \
+    apt-get update && \
+    apt-get install -y clickhouse-client && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create directories
+RUN mkdir -p /app/scripts /app/backups /app/config /app/logs
+
+# Copy backup script
+COPY ./ch-dr.sh /app/scripts/
+RUN chmod +x /app/scripts/ch-dr.sh
+
+# Create sample config
+COPY ./ch-dr-config.yaml /app/config/
+
+# Set up cron job for backups
+RUN echo "0 2 * * * root /app/scripts/ch-dr.sh --config /app/config/ch-dr-config.yaml --onprem backup >> /app/logs/backup.log 2>&1" > /etc/cron.d/clickhouse-backup
+RUN chmod 0644 /etc/cron.d/clickhouse-backup
+
+# Create supervisor configuration
+RUN echo "[supervisord]\n\
+nodaemon=true\n\
+logfile=/app/logs/supervisord.log\n\
+\n\
+[program:cron]\n\
+command=cron -f\n\
+autostart=true\n\
+autorestart=true\n\
+stdout_logfile=/app/logs/cron.log\n\
+stderr_logfile=/app/logs/cron-error.log\n\
+\n\
+[program:backup-monitor]\n\
+command=/bin/bash -c \"tail -f /app/logs/backup.log\"\n\
+autostart=true\n\
+autorestart=true\n\
+stdout_logfile=/dev/stdout\n\
+stdout_logfile_maxbytes=0\n\
+stderr_logfile=/dev/stderr\n\
+stderr_logfile_maxbytes=0\n" > /etc/supervisor/conf.d/supervisord.conf
+
+# Set up entrypoint
+COPY ./entrypoint.sh /app/scripts/
+RUN chmod +x /app/scripts/entrypoint.sh
+
+# Create data volume
+VOLUME ["/app/backups", "/app/config", "/app/logs"]
+
+# Set working directory
+WORKDIR /app
+
+# Expose port for health checks
+EXPOSE 8080
+
+# Set entrypoint
+ENTRYPOINT ["/app/scripts/entrypoint.sh"]
+
+# Default command
+CMD ["supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
