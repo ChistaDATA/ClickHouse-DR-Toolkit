@@ -1,0 +1,248 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-dr-config
+  namespace: clickhouse
+data:
+  ch-dr-config.yaml: |
+    # ClickHouse Disaster Recovery Configuration
+    
+    # For Kubernetes, we use in-cluster connection
+    host: clickhouse-service
+    port: 9000
+    user: default
+    password: ""
+    
+    # Backup Settings
+    backup_dir: /backups
+    retention_days: 7
+    
+    # Databases to backup (leave empty to backup all)
+    databases:
+      # - db1
+      # - db2
+    
+    # S3 Settings
+    use_s3: true
+    s3_bucket: clickhouse-backups
+    s3_path: production
+    
+    # Kubernetes Settings
+    namespace: clickhouse
+    pod_prefix: clickhouse
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: clickhouse-dr-s3-credentials
+  namespace: clickhouse
+type: Opaque
+stringData:
+  .s3cfg: |
+    [default]
+    access_key = YOUR_ACCESS_KEY
+    secret_key = YOUR_SECRET_KEY
+    bucket_location = us-east-1
+    use_https = True
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: clickhouse-dr-backups-pvc
+  namespace: clickhouse
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: standard
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clickhouse-dr
+  namespace: clickhouse
+  labels:
+    app: clickhouse-dr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: clickhouse-dr
+  template:
+    metadata:
+      labels:
+        app: clickhouse-dr
+    spec:
+      serviceAccountName: clickhouse-dr-sa
+      containers:
+      - name: clickhouse-dr
+        image: ubuntu:22.04
+        command:
+        - /bin/bash
+        - -c
+        - |
+          apt-get update && apt-get install -y curl wget s3cmd clickhouse-client && \
+          mkdir -p /scripts && \
+          echo "Waiting for script to be downloaded..." && \
+          while ! [ -f /scripts/ch-dr.sh ]; do sleep 5; done && \
+          chmod +x /scripts/ch-dr.sh && \
+          echo "Script is ready. Starting service..." && \
+          tail -f /dev/null
+        volumeMounts:
+        - name: config-volume
+          mountPath: /config
+        - name: backups-volume
+          mountPath: /backups
+        - name: scripts-volume
+          mountPath: /scripts
+        - name: s3-config-volume
+          mountPath: /root/.s3cfg
+          subPath: .s3cfg
+      volumes:
+      - name: config-volume
+        configMap:
+          name: clickhouse-dr-config
+      - name: backups-volume
+        persistentVolumeClaim:
+          claimName: clickhouse-dr-backups-pvc
+      - name: scripts-volume
+        emptyDir: {}
+      - name: s3-config-volume
+        secret:
+          secretName: clickhouse-dr-s3-credentials
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: clickhouse-dr-sa
+  namespace: clickhouse
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: clickhouse-dr-role
+  namespace: clickhouse
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/exec"]
+  verbs: ["get", "list", "create", "delete", "patch", "update"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: clickhouse-dr-role-binding
+  namespace: clickhouse
+subjects:
+- kind: ServiceAccount
+  name: clickhouse-dr-sa
+  namespace: clickhouse
+roleRef:
+  kind: Role
+  name: clickhouse-dr-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: clickhouse-dr-backup
+  namespace: clickhouse
+spec:
+  schedule: "0 2 * * *"  # Run daily at 2 AM
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: clickhouse-dr-sa
+          containers:
+          - name: backup-job
+            image: ubuntu:22.04
+            command:
+            - /bin/bash
+            - -c
+            - |
+              apt-get update && apt-get install -y curl wget s3cmd clickhouse-client kubectl && \
+              if [ -f /scripts/ch-dr.sh ]; then
+                chmod +x /scripts/ch-dr.sh
+                /scripts/ch-dr.sh --config /config/ch-dr-config.yaml --k8s backup
+              else
+                echo "Backup script not found!"
+                exit 1
+              fi
+            volumeMounts:
+            - name: config-volume
+              mountPath: /config
+            - name: backups-volume
+              mountPath: /backups
+            - name: scripts-volume
+              mountPath: /scripts
+            - name: s3-config-volume
+              mountPath: /root/.s3cfg
+              subPath: .s3cfg
+          restartPolicy: OnFailure
+          volumes:
+          - name: config-volume
+            configMap:
+              name: clickhouse-dr-config
+          - name: backups-volume
+            persistentVolumeClaim:
+              claimName: clickhouse-dr-backups-pvc
+          - name: scripts-volume
+            emptyDir: {}
+          - name: s3-config-volume
+            secret:
+              secretName: clickhouse-dr-s3-credentials
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-dr-script-loader
+  namespace: clickhouse
+data:
+  load-script.sh: |
+    #!/bin/bash
+    set -e
+    
+    # This script loads the backup script into the shared volume
+    echo "Loading ClickHouse DR script..."
+    
+    # Copy the ch-dr.sh script to the shared volume
+    cat > /scripts/ch-dr.sh << 'EOF'
+    # The script content will be injected here when you apply this ConfigMap
+    EOF
+    
+    chmod +x /scripts/ch-dr.sh
+    echo "Script loaded successfully!"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: load-clickhouse-dr-script
+  namespace: clickhouse
+spec:
+  ttlSecondsAfterFinished: 86400  # Keep job info for 1 day after completion
+  template:
+    spec:
+      containers:
+      - name: script-loader
+        image: busybox:latest
+        command: ["/bin/sh", "/config/load-script.sh"]
+        volumeMounts:
+        - name: config-volume
+          mountPath: /config
+        - name: scripts-volume
+          mountPath: /scripts
+      restartPolicy: OnFailure
+      volumes:
+      - name: config-volume
+        configMap:
+          name: clickhouse-dr-script-loader
+          defaultMode: 0755
+      - name: scripts-volume
+        emptyDir: {}
