@@ -19,7 +19,7 @@ A comprehensive disaster recovery solution for ClickHouse databases, supporting 
 1. **Clone the Repository**
 
 ```bash
-git clone https://github.com/your-repo/clickhouse-dr
+git clone https://github.com/ChistaDATA/ClickHouse-DR-Toolkit/
 cd clickhouse-dr
 ```
 
