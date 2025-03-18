@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  clickhouse-dr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: clickhouse-dr
+    restart: unless-stopped
+    environment:
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=9000
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+      - S3_ACCESS_KEY=
+      - S3_SECRET_KEY=
+      - S3_REGION=us-east-1
+      - S3_BUCKET=clickhouse-backups
+      - S3_PATH=production
+      - BACKUP_ON_START=false
+    volumes:
+      - ./config:/app/config
+      - ./backups:/app/backups
+      - ./logs:/app/logs
+    ports:
+      - "8080:8080"
+    networks:
+      - clickhouse-network
+
+  # Optional: Include ClickHouse for local testing
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse
+    restart: unless-stopped
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    networks:
+      - clickhouse-network
+
+volumes:
+  clickhouse-data:
+
+networks:
+  clickhouse-network:
+    driver: bridge
